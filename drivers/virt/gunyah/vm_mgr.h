@@ -8,13 +8,26 @@
 
 #include <linux/device.h>
 #include <linux/kref.h>
+#include <linux/maple_tree.h>
 #include <linux/mutex.h>
+#include <linux/pagemap.h>
 #include <linux/rwsem.h>
+#include <linux/set_memory.h>
 #include <linux/wait.h>
 
 #include <uapi/linux/gunyah.h>
 
 #include "rsc_mgr.h"
+
+static inline u64 gunyah_gpa_to_gfn(u64 gpa)
+{
+	return gpa >> PAGE_SHIFT;
+}
+
+static inline u64 gunyah_gfn_to_gpa(u64 gfn)
+{
+	return gfn << PAGE_SHIFT;
+}
 
 long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 			     unsigned long arg);
@@ -22,6 +35,26 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
 /**
  * struct gunyah_vm - Main representation of a Gunyah Virtual machine
  * @vmid: Gunyah's VMID for this virtual machine
+ * @mm: A maple tree of all memory that has been mapped to a VM.
+ *      Indices are guest frame numbers; entries are either folios or
+ *      RM mem parcels
+ * @addrspace_ticket: Resource ticket to the capability for guest VM's
+ *                    address space
+ * @host_private_extent_ticket: Resource ticket to the capability for our
+ *                              memory extent from which to lend private
+ *                              memory to the guest
+ * @host_shared_extent_ticket: Resource ticket to the capaiblity for our
+ *                             memory extent from which to share memory
+ *                             with the guest. Distinction with
+ *                             @host_private_extent_ticket needed for
+ *                             current Qualcomm platforms; on non-Qualcomm
+ *                             platforms, this is the same capability ID
+ * @guest_private_extent_ticket: Resource ticket to the capaiblity for
+ *                               the guest's memory extent to lend private
+ *                               memory to
+ * @guest_shared_extent_ticket: Resource ticket to the capability for
+ *                              the memory extent that represents
+ *                              memory shared with the guest.
  * @rm: Pointer to the resource manager struct to make RM calls
  * @parent: For logging
  * @nb: Notifier block for RM notifications
@@ -43,6 +76,11 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  */
 struct gunyah_vm {
 	u16 vmid;
+	struct maple_tree mm;
+	struct gunyah_vm_resource_ticket addrspace_ticket,
+		host_private_extent_ticket, host_shared_extent_ticket,
+		guest_private_extent_ticket, guest_shared_extent_ticket;
+
 	struct gunyah_rm *rm;
 
 	struct notifier_block nb;
@@ -60,7 +98,17 @@ struct gunyah_vm {
 
 	struct device *parent;
 	enum gunyah_rm_vm_auth_mechanism auth;
-
 };
+
+int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
+			      struct gunyah_rm_mem_parcel *parcel, u64 gfn,
+			      u64 nr);
+void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
+int gunyah_vm_reclaim_parcel(struct gunyah_vm *ghvm,
+			     struct gunyah_rm_mem_parcel *parcel, u64 gfn);
+int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
+			    u64 gfn, bool share, bool write);
+int gunyah_vm_reclaim_folio(struct gunyah_vm *ghvm, u64 gfn, struct folio *folio);
+int gunyah_vm_reclaim_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
 
 #endif
