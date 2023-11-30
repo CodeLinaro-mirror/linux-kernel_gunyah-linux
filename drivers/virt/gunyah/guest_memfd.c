@@ -34,6 +34,11 @@ struct gunyah_gmem_binding {
 	unsigned long nr;
 };
 
+static inline pgoff_t gunyah_gfn_to_off(struct gunyah_gmem_binding *b, u64 gfn)
+{
+	return gfn - b->gfn + b->i_off;
+}
+
 static inline u64 gunyah_off_to_gfn(struct gunyah_gmem_binding *b, pgoff_t off)
 {
 	return off - b->i_off + b->gfn;
@@ -54,12 +59,56 @@ static inline bool gunyah_guest_mem_is_lend(struct gunyah_vm *ghvm, u32 flags)
 
 static int gunyah_gmem_invalidate_begin(struct inode *inode, pgoff_t offset, unsigned long nr)
 {
+	struct gunyah_gmem_binding *b;
+	u64 gfn, gnr;
+	int r;
+
+	list_for_each_entry(b, &inode->i_mapping->i_private_list, i_entry) {
+		/* skip if no overlap */
+		if (offset + nr < b->i_off)
+			continue;
+		if (offset > b->i_off + b->nr)
+			continue;
+
+		gfn = gunyah_off_to_gfn(b, offset);
+		/* limit nr of pages to reclaim by end of binding */
+		gnr = max(b->gfn + b->nr, gfn + nr) - gfn;
+		r = gunyah_vm_reclaim_range(b->ghvm, gfn, gnr);
+		if (r < 0)
+			return r;
+	}
+
 	return 0;
 }
 
 static int gunyah_gmem_accessible(struct inode *inode, struct folio *folio, pgoff_t offset, unsigned long nr)
 {
-	return 0;
+	struct address_space *const mapping = inode->i_mapping;
+	struct gunyah_gmem_binding *b;
+	int ret = 0;
+	u64 gfn;
+
+	/* TODO: Splitting large folios */
+	if (offset || folio_nr_pages(folio) != nr)
+		return -EPERM;
+
+	list_for_each_entry(b, &mapping->i_private_list, i_entry) {
+		if (!gunyah_guest_mem_is_lend(b->ghvm, b->flags))
+			continue;
+
+		/* if the binding doesn't cover the request range: skip*/
+		if (offset + nr < b->i_off)
+			continue;
+		if (offset > b->i_off + b->nr)
+			continue;
+
+		gfn = gunyah_off_to_gfn(b, offset);
+		ret = gunyah_vm_reclaim_folio(b->ghvm, gfn, folio);
+		if (ret)
+			break;
+	}
+
+	return ret;
 }
 
 static int gunyah_gmem_release(struct inode *inode)
@@ -545,3 +594,109 @@ int gunyah_gmem_reclaim_parcel(struct gunyah_vm *ghvm,
 
 	return 0;
 }
+
+int gunyah_gmem_setup_demand_paging(struct gunyah_vm *ghvm)
+{
+	struct gunyah_rm_mem_entry *entries;
+	struct gunyah_gmem_binding *b;
+	unsigned long index = 0;
+	u32 count = 0, i;
+	int ret = 0;
+
+	down_read(&ghvm->bindings_lock);
+	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX)
+		if (gunyah_guest_mem_is_lend(ghvm, b->flags))
+			count++;
+
+	if (!count)
+		goto out;
+
+	entries = kcalloc(count, sizeof(*entries), GFP_KERNEL);
+	if (!entries) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	index = i = 0;
+	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
+		if (!gunyah_guest_mem_is_lend(ghvm, b->flags))
+			continue;
+		entries[i].phys_addr = cpu_to_le64(gunyah_gfn_to_gpa(b->gfn));
+		entries[i].size = cpu_to_le64(b->nr << PAGE_SHIFT);
+		if (++i == count)
+			break;
+	}
+
+	ret = gunyah_rm_vm_set_demand_paging(ghvm->rm, ghvm->vmid, i, entries);
+	kfree(entries);
+out:
+	up_read(&ghvm->bindings_lock);
+	return ret;
+}
+
+int gunyah_gmem_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
+{
+	unsigned long gfn = gunyah_gpa_to_gfn(gpa);
+	struct gunyah_gmem_binding *b;
+	struct folio *folio;
+	int ret;
+
+	down_read(&ghvm->bindings_lock);
+	b = mtree_load(&ghvm->bindings, gfn);
+	if (!b) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (write && !(b->flags & GUNYAH_MEM_ALLOW_WRITE)) {
+		ret = -EPERM;
+		goto unlock;
+	}
+
+	filemap_invalidate_lock_shared(b->file->f_mapping);
+	folio = guest_memfd_grab_folio(b->file, gunyah_gfn_to_off(b, gfn),
+					GUEST_MEMFD_PREPARE);
+	if (IS_ERR(folio)) {
+		ret = PTR_ERR(folio);
+		pr_err_ratelimited(
+			"Failed to obtain memory for guest addr %016llx: %d\n",
+			gpa, ret);
+		goto unlock;
+	}
+
+	if (gunyah_guest_mem_is_lend(ghvm, b->flags)) {
+		ret = guest_memfd_make_inaccessible(file_inode(b->file), folio);
+		if (ret) {
+			pr_err_ratelimited(
+				"Failed to make guest addr %016llx inaccessible: %d\n",
+				gpa, ret);
+			goto unlock;
+		}
+	}
+
+	/**
+	 * the folio covers the requested guest address, but the folio may not
+	 * start at the requested guest address. recompute the gfn based on the
+	 * folio itself.
+	 */
+	gfn = gunyah_off_to_gfn(b, folio_index(folio));
+
+	ret = gunyah_vm_provide_folio(ghvm, folio, gfn,
+				      !gunyah_guest_mem_is_lend(ghvm, b->flags),
+				      !!(b->flags & GUNYAH_MEM_ALLOW_WRITE));
+	filemap_invalidate_unlock_shared(b->file->f_mapping);
+	if (ret) {
+		if (ret != -EAGAIN)
+			pr_err_ratelimited(
+				"Failed to provide folio for guest addr: %016llx: %d\n",
+				gpa, ret);
+		goto out;
+	}
+out:
+	folio_unlock(folio);
+	folio_put(folio);
+unlock:
+	up_read(&ghvm->bindings_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gunyah_gmem_demand_page);
