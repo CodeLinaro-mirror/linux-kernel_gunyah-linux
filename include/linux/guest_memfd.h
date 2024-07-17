@@ -17,6 +17,10 @@ struct guest_memfd_operations {
 };
 
 enum {
+	GUEST_MEMFD_FLAG_NO_DIRECT_MAP		= BIT(0),
+};
+
+enum {
 	GUEST_MEMFD_GRAB_UPTODATE	= BIT(0),
 	GUEST_MEMFD_PREPARE		= BIT(1),
 };

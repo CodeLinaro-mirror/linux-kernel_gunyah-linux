@@ -7,12 +7,15 @@
 #include <linux/falloc.h>
 #include <linux/guest_memfd.h>
 #include <linux/pagemap.h>
+#include <linux/set_memory.h>
 
 struct folio *guest_memfd_grab_folio(struct file *file, pgoff_t index, u32 flags)
 {
+	unsigned long gmem_flags = (unsigned long)file->private_data;
 	struct inode *inode = file_inode(file);
 	struct guest_memfd_operations *ops = inode->i_private;
 	struct folio *folio;
+	unsigned long i;
 	int r;
 
 	/* TODO: Support huge pages. */
@@ -42,11 +45,31 @@ struct folio *guest_memfd_grab_folio(struct file *file, pgoff_t index, u32 flags
 			goto out_err;
 	}
 
+	if (gmem_flags & GUEST_MEMFD_FLAG_NO_DIRECT_MAP) {
+		unsigned long nr_pages = folio_nr_pages(folio);
+
+		for (i = 0; i < nr_pages; i++) {
+			struct page *page = folio_page(folio, i);
+
+			r = set_direct_map_invalid_noflush(page);
+			if (r < 0)
+				goto out_remap;
+		}
+
+		folio_set_private(folio);
+	}
+
 	/*
 	 * Ignore accessed, referenced, and dirty flags.  The memory is
 	 * unevictable and there is no storage to write back to.
 	 */
 	return folio;
+out_remap:
+	for (; i > 0; i--) {
+		struct page *page = folio_page(folio, i - 1);
+		BUG_ON(set_direct_map_default_noflush(page));
+	}
+	folio_clear_private(folio);
 out_err:
 	folio_unlock(folio);
 	folio_put(folio);
@@ -198,6 +221,29 @@ static int gmem_error_folio(struct address_space *mapping, struct folio *folio)
 	return ret;
 }
 
+static void gmem_invalidate_folio(struct folio *folio, size_t offset, size_t len)
+{
+	struct inode *inode = folio_inode(folio);
+	struct guest_memfd_operations *ops = inode->i_private;
+	unsigned long i, nr = folio_nr_pages(folio);
+	unsigned long start = (unsigned long)folio_address(folio);
+
+	/* TODO: partial invalidation of huge folios */
+	BUG_ON(offset || len != folio_size(folio));
+
+	for (i = 0; i < nr; i++) {
+		struct page *page = folio_page(folio, i);
+
+		BUG_ON(set_direct_map_default_noflush(page));
+	}
+	flush_tlb_kernel_range(start, start + folio_size(folio));
+
+	folio_clear_private(folio);
+
+	if (ops->invalidate_folio)
+		ops->invalidate_folio(inode, folio);
+}
+
 static bool gmem_release_folio(struct folio *folio, gfp_t gfp)
 {
 	struct inode *inode = folio_inode(folio);
@@ -212,6 +258,15 @@ static bool gmem_release_folio(struct folio *folio, gfp_t gfp)
 	if (ops->invalidate_end)
 		ops->invalidate_end(inode, offset, nr);
 
+	for (i = 0; i < nr; i++) {
+		struct page *page = folio_page(folio, i);
+
+		BUG_ON(set_direct_map_default_noflush(page));
+	}
+	flush_tlb_kernel_range(start, start + folio_size(folio));
+
+	folio_clear_private(folio);
+
 	return true;
 }
 
@@ -219,6 +274,7 @@ static const struct address_space_operations gmem_aops = {
 	.dirty_folio = noop_dirty_folio,
 	.migrate_folio	= gmem_migrate_folio,
 	.error_remove_folio = gmem_error_folio,
+	.invalidate_folio = gmem_invalidate_folio,
 	.release_folio = gmem_release_folio,
 };
 
@@ -239,7 +295,7 @@ struct file *guest_memfd_alloc(const char *name, const struct guest_memfd_operat
 	if (!guest_memfd_check_ops(ops))
 		return ERR_PTR(-EINVAL);
 
-	if (flags)
+	if (flags & ~GUEST_MEMFD_FLAG_NO_DIRECT_MAP)
 		return ERR_PTR(-EINVAL);
 
 	/*
