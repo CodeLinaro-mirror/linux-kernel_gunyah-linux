@@ -9,6 +9,8 @@
 #include <linux/pagemap.h>
 #include <linux/set_memory.h>
 
+#include "internal.h"
+
 struct folio *guest_memfd_grab_folio(struct file *file, pgoff_t index, u32 flags)
 {
 	unsigned long gmem_flags = (unsigned long)file->private_data;
@@ -17,6 +19,11 @@ struct folio *guest_memfd_grab_folio(struct file *file, pgoff_t index, u32 flags
 	struct folio *folio;
 	unsigned long i;
 	int r;
+
+	/* if page is already allocated, return and don't touch it! */
+	folio = filemap_lock_folio(inode->i_mapping, index);
+	if (!IS_ERR(folio))
+		return folio;
 
 	/* TODO: Support huge pages. */
 	folio = filemap_grab_folio(inode->i_mapping, index);
@@ -76,6 +83,70 @@ out_err:
 	return ERR_PTR(r);
 }
 EXPORT_SYMBOL_GPL(guest_memfd_grab_folio);
+
+int guest_memfd_make_inaccessible(struct inode *inode, struct folio *folio)
+{
+	unmap_mapping_folio(folio);
+
+	/**
+	 * We can't use the refcount. It might be elevated due to
+	 * guest/vcpu trying to access same folio as another vcpu
+	 * or because userspace is trying to access folio for same reason
+	 *
+	 * folio_lock serializes the transitions between (in)accessible
+	 */
+	if (folio_maybe_dma_pinned(folio))
+		return -EBUSY;
+
+	return 0;
+}
+
+static vm_fault_t gmem_fault(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct inode *inode = file_inode(file);
+	const struct guest_memfd_operations *ops = inode->i_private;
+	struct folio *folio;
+	pgoff_t off;
+	int r;
+
+	folio = guest_memfd_grab_folio(file, vmf->pgoff, GUEST_MEMFD_GRAB_UPTODATE);
+	if (!folio)
+		return VM_FAULT_SIGBUS;
+
+	off = vmf->pgoff & (folio_nr_pages(folio) - 1);
+	r = ops->accessible(inode, folio, off, 1);
+	if (r) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return VM_FAULT_SIGBUS;
+	}
+
+	vmf->page = folio_page(folio, off);
+
+	return VM_FAULT_LOCKED;
+}
+
+static const struct vm_operations_struct gmem_vm_ops = {
+	.fault = gmem_fault,
+};
+
+static int gmem_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	const struct guest_memfd_operations *ops = file_inode(file)->i_private;
+
+	if (!ops->accessible)
+		return -EPERM;
+
+	/* No support for private mappings to avoid COW.  */
+	if ((vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) !=
+	    (VM_SHARED | VM_MAYSHARE))
+		return -EINVAL;
+
+	file_accessed(file);
+	vma->vm_ops = &gmem_vm_ops;
+	return 0;
+}
 
 static long gmem_punch_hole(struct file *file, loff_t offset, loff_t len)
 {
@@ -189,6 +260,7 @@ static int gmem_release(struct inode *inode, struct file *file)
 static struct file_operations gmem_fops = {
 	.open		= generic_file_open,
 	.llseek		= generic_file_llseek,
+	.mmap		= gmem_mmap,
 	.release	= gmem_release,
 	.fallocate	= gmem_fallocate,
 	.owner = THIS_MODULE,
@@ -248,8 +320,10 @@ static bool gmem_release_folio(struct folio *folio, gfp_t gfp)
 {
 	struct inode *inode = folio_inode(folio);
 	struct guest_memfd_operations *ops = inode->i_private;
+	unsigned long start = (unsigned long)folio_address(folio);
 	off_t offset = folio->index;
 	size_t nr = folio_nr_pages(folio);
+	unsigned long i;
 	int ret;
 
 	ret = ops->invalidate_begin(inode, offset, nr);

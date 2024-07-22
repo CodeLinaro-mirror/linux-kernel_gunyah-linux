@@ -12,6 +12,8 @@ struct guest_memfd_operations {
 	int (*invalidate_begin)(struct inode *inode, pgoff_t offset, unsigned long nr);
 	void (*invalidate_end)(struct inode *inode, pgoff_t offset, unsigned long nr);
 	int (*prepare)(struct inode *inode, pgoff_t offset, struct folio *folio);
+	int (*accessible)(struct inode *inode, struct folio *folio,
+			  pgoff_t offset, unsigned long nr);
 	void (*invalidate_folio)(struct inode *inode, struct folio *folio);
 	int (*release)(struct inode *inode);
 };
@@ -29,5 +31,6 @@ struct folio *guest_memfd_grab_folio(struct file *file, pgoff_t index, u32 flags
 struct file *guest_memfd_alloc(const char *name, const struct guest_memfd_operations *ops, loff_t size,
 			       unsigned long flags);
 bool is_guest_memfd(struct file *file, const struct guest_memfd_operations *ops);
+int guest_memfd_make_inaccessible(struct inode *inode, struct folio *folio);
 
 #endif
